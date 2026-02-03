@@ -1,0 +1,343 @@
+#!/bin/bash
+# touch-grass - Stop touching grass (green squares). Go touch real grass.
+# https://github.com/ellyseum/touch-grass
+
+SCRIPT_PATH="$HOME/.local/bin/touch-grass"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/touch-grass"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/touch-grass"
+CONFIG_FILE="$CONFIG_DIR/config"
+CACHE_FILE="$CACHE_DIR/cache.json"
+REPO="ellyseum/touch-grass"
+REPO_URL="https://raw.githubusercontent.com/$REPO/main"
+
+# Ensure directories exist
+mkdir -p "$CONFIG_DIR" "$CACHE_DIR"
+
+# --- Subcommands ---
+
+show_help() {
+  echo "🌱 touch-grass - Git commit limiter for contribution graph protection"
+  echo ""
+  echo "Usage: touch-grass [command]"
+  echo ""
+  echo "Commands:"
+  echo "  (no args)    Run commit check (called by git wrapper)"
+  echo "  config       View or edit configuration"
+  echo "  update       Update to latest version"
+  echo "  uninstall    Remove touch-grass completely"
+  echo "  help         Show this help"
+  echo ""
+}
+
+do_config() {
+  echo "🌱 touch-grass config"
+  echo ""
+
+  # Show current settings
+  [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+  # Get historical max
+  HISTORICAL_MAX=$(cat "$CACHE_FILE" 2>/dev/null | jq -r '.max // empty')
+  [[ -z "$HISTORICAL_MAX" ]] && HISTORICAL_MAX="(not cached yet)"
+
+  echo "Current settings:"
+  echo "  Historical max: $HISTORICAL_MAX"
+  echo "  TARGET_MAX:     ${TARGET_MAX:-"(using historical)"}"
+  echo "  SOFT_BUFFER:    ${SOFT_BUFFER:-10}"
+  echo ""
+  echo "Config file: $CONFIG_FILE"
+  echo ""
+
+  read -p "Edit config? [y/N] " -n 1 -r
+  echo ""
+
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo ""
+    read -p "Target max commits per day (current: ${TARGET_MAX:-$HISTORICAL_MAX}): " NEW_MAX
+    read -p "Soft warning buffer (current: ${SOFT_BUFFER:-10}): " NEW_BUFFER
+
+    # Save config
+    {
+      echo "# touch-grass config"
+      echo "# https://github.com/$REPO"
+      [[ -n "$NEW_MAX" ]] && echo "TARGET_MAX=$NEW_MAX"
+      echo "SOFT_BUFFER=${NEW_BUFFER:-${SOFT_BUFFER:-10}}"
+    } > "$CONFIG_FILE"
+
+    echo ""
+    echo "✅ Config saved!"
+  fi
+
+  exit 0
+}
+
+do_update() {
+  echo "🌱 Checking for updates..."
+
+  # Get installed hashes
+  CACHE_CONTENT=$(cat "$CACHE_FILE" 2>/dev/null || echo '{}')
+  INSTALLED_SCRIPT=$(echo "$CACHE_CONTENT" | jq -r '.script_hash // empty')
+  INSTALLED_INSTALLER=$(echo "$CACHE_CONTENT" | jq -r '.installer_hash // empty')
+
+  # Get latest file hashes from GitHub
+  LATEST_SCRIPT=$(gh api "repos/$REPO/contents/touch-grass" --jq '.sha' 2>/dev/null)
+  LATEST_INSTALLER=$(gh api "repos/$REPO/contents/install.sh" --jq '.sha' 2>/dev/null)
+
+  if [[ -z "$LATEST_SCRIPT" ]]; then
+    echo "❌ Failed to check for updates. Check your internet connection."
+    exit 1
+  fi
+
+  if [[ "$INSTALLED_SCRIPT" == "$LATEST_SCRIPT" && "$INSTALLED_INSTALLER" == "$LATEST_INSTALLER" ]]; then
+    echo "✅ Already up to date!"
+    exit 0
+  fi
+
+  # If installer changed, do full reinstall
+  if [[ "$INSTALLED_INSTALLER" != "$LATEST_INSTALLER" ]]; then
+    echo "📦 Installer updated, reinstalling..."
+    do_uninstall
+    echo ""
+    curl -fsSL "$REPO_URL/install.sh" | bash
+    exit $?
+  fi
+
+  # Just update the script
+  echo "📥 Downloading update..."
+  if curl -fsSL "$REPO_URL/touch-grass" -o "$SCRIPT_PATH.new"; then
+    mv "$SCRIPT_PATH.new" "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+
+    # Update script hash in cache
+    echo "$CACHE_CONTENT" | jq --arg hash "$LATEST_SCRIPT" '.script_hash = $hash' > "$CACHE_FILE"
+
+    echo "✅ Updated to latest version!"
+  else
+    rm -f "$SCRIPT_PATH.new"
+    echo "❌ Update failed."
+    exit 1
+  fi
+
+  exit 0
+}
+
+do_uninstall() {
+  echo "🌱 Uninstalling touch-grass..."
+
+  # Remove files
+  rm -f "$SCRIPT_PATH"
+  rm -rf "$CONFIG_DIR"
+  rm -rf "$CACHE_DIR"
+  echo "   ✓ Removed touch-grass files"
+
+  # Remove from shell RC
+  for RC in ~/.zshrc ~/.bashrc; do
+    if [[ -f "$RC" ]] && grep -q ">>> touch-grass >>>" "$RC" 2>/dev/null; then
+      sed -i '/# >>> touch-grass >>>/,/# <<< touch-grass <<</d' "$RC"
+      echo "   ✓ Removed git wrapper from $RC"
+    fi
+  done
+
+  echo ""
+  echo "✅ touch-grass uninstalled!"
+  echo "   Restart your shell or run: exec \$SHELL"
+  echo ""
+  echo "🌿 Thanks for touching grass with us!"
+  exit 0
+}
+
+# --- Handle subcommands ---
+case "${1:-}" in
+  help|--help|-h)
+    show_help
+    exit 0
+    ;;
+  config)
+    do_config
+    ;;
+  update)
+    do_update
+    ;;
+  uninstall)
+    do_uninstall
+    ;;
+  commit|"")
+    # Fall through to main commit check logic below
+    ;;
+  push)
+    shift  # Remove 'push' from args
+    # The wrapper passes all git args, extract remote if specified
+    REMOTE="origin"
+    for arg in "$@"; do
+      [[ "$arg" != -* && "$arg" != "push" ]] && REMOTE="$arg" && break
+    done
+
+    # Count commits to be pushed (with today's author date)
+    TODAY=$(date +%Y-%m-%d)
+    UPSTREAM=$(command git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null || echo "origin/main")
+    PUSH_COUNT=$(command git log "$UPSTREAM..HEAD" --format='%ad' --date=short 2>/dev/null | grep -c "$TODAY")
+    [[ -z "$PUSH_COUNT" ]] && PUSH_COUNT=0
+
+    if [[ "$PUSH_COUNT" -gt 0 ]]; then
+      # Get GitHub today count
+      GITHUB_TODAY=$(gh api graphql -f query='query { viewer { contributionsCollection { contributionCalendar { weeks { contributionDays { date contributionCount } } } } } }' --jq ".data.viewer.contributionsCollection.contributionCalendar.weeks[-1].contributionDays[] | select(.date == \"$TODAY\") | .contributionCount" 2>/dev/null || echo 0)
+      [[ -z "$GITHUB_TODAY" || "$GITHUB_TODAY" == "null" ]] && GITHUB_TODAY=0
+
+      # Load config
+      CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/touch-grass/config"
+      [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+      TARGET_MAX=${TARGET_MAX:-50}
+
+      TOTAL=$((GITHUB_TODAY + PUSH_COUNT))
+
+      if [[ $TOTAL -gt $TARGET_MAX ]]; then
+        echo ""
+        echo "🌱 Whoa there! Pushing $PUSH_COUNT commits would bring you to $TOTAL today!"
+        echo "   GitHub: $GITHUB_TODAY | This push: +$PUSH_COUNT"
+        echo "   Your target max is $TARGET_MAX"
+        echo ""
+        echo "   Maybe squash some commits first? 🌿"
+        echo ""
+        read -p "Continue anyway? [y/N] " -n 1 -r
+        echo ""
+        [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+      elif [[ $TOTAL -gt $((TARGET_MAX - 10)) ]]; then
+        echo ""
+        echo "🌿 Heads up: Pushing $PUSH_COUNT commits will bring you to $TOTAL today"
+        echo "   (target: $TARGET_MAX)"
+        echo ""
+      fi
+    fi
+    exit 0
+    ;;
+esac
+
+# --- Main commit check logic ---
+
+TODAY=$(date +%Y-%m-%d)
+
+# Load user config if exists
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# Fetch contribution data (today's count and historical max)
+CONTRIB_DATA=$(gh api graphql -f query='
+query {
+  viewer {
+    contributionsCollection {
+      contributionCalendar {
+        weeks {
+          contributionDays {
+            date
+            contributionCount
+          }
+        }
+      }
+    }
+  }
+}' 2>/dev/null)
+
+# Get today's count
+GITHUB_TODAY=$(echo "$CONTRIB_DATA" | jq -r ".data.viewer.contributionsCollection.contributionCalendar.weeks[-1].contributionDays[] | select(.date == \"$TODAY\") | .contributionCount" 2>/dev/null)
+[[ -z "$GITHUB_TODAY" || "$GITHUB_TODAY" == "null" ]] && GITHUB_TODAY=0
+
+# Load or update cache
+CACHE_CONTENT=$(cat "$CACHE_FILE" 2>/dev/null || echo '{}')
+CACHE_DATE=$(echo "$CACHE_CONTENT" | jq -r '.date // empty')
+
+if [[ "$CACHE_DATE" != "$TODAY" ]]; then
+  # Update historical max
+  HISTORICAL_MAX=$(echo "$CONTRIB_DATA" | jq '[.data.viewer.contributionsCollection.contributionCalendar.weeks[].contributionDays[].contributionCount] | max' 2>/dev/null)
+  [[ -z "$HISTORICAL_MAX" || "$HISTORICAL_MAX" == "null" ]] && HISTORICAL_MAX=50
+
+  # Check for updates (once per day)
+  INSTALLED_SCRIPT=$(echo "$CACHE_CONTENT" | jq -r '.script_hash // empty')
+  INSTALLED_INSTALLER=$(echo "$CACHE_CONTENT" | jq -r '.installer_hash // empty')
+  LATEST_SCRIPT=$(gh api "repos/$REPO/contents/touch-grass" --jq '.sha' 2>/dev/null || echo "$INSTALLED_SCRIPT")
+  LATEST_INSTALLER=$(gh api "repos/$REPO/contents/install.sh" --jq '.sha' 2>/dev/null || echo "$INSTALLED_INSTALLER")
+
+  # Save cache (preserve installed hashes, add latest for comparison)
+  jq -n \
+    --arg date "$TODAY" \
+    --argjson max "$HISTORICAL_MAX" \
+    --arg script "$INSTALLED_SCRIPT" \
+    --arg installer "$INSTALLED_INSTALLER" \
+    --arg latest_script "$LATEST_SCRIPT" \
+    --arg latest_installer "$LATEST_INSTALLER" \
+    '{date: $date, max: $max, script_hash: $script, installer_hash: $installer, latest_script: $latest_script, latest_installer: $latest_installer}' > "$CACHE_FILE"
+
+  # Notify if update available
+  if [[ -n "$INSTALLED_SCRIPT" && ("$LATEST_SCRIPT" != "$INSTALLED_SCRIPT" || "$LATEST_INSTALLER" != "$INSTALLED_INSTALLER") ]]; then
+    echo "🌱 Update available! Run: touch-grass update"
+    echo ""
+  fi
+else
+  HISTORICAL_MAX=$(echo "$CACHE_CONTENT" | jq -r '.max')
+
+  # Check for update notification (from cache)
+  INSTALLED_SCRIPT=$(echo "$CACHE_CONTENT" | jq -r '.script_hash // empty')
+  LATEST_SCRIPT=$(echo "$CACHE_CONTENT" | jq -r '.latest_script // empty')
+  INSTALLED_INSTALLER=$(echo "$CACHE_CONTENT" | jq -r '.installer_hash // empty')
+  LATEST_INSTALLER=$(echo "$CACHE_CONTENT" | jq -r '.latest_installer // empty')
+  if [[ -n "$INSTALLED_SCRIPT" && ("$LATEST_SCRIPT" != "$INSTALLED_SCRIPT" || "$LATEST_INSTALLER" != "$INSTALLED_INSTALLER") ]]; then
+    echo "🌱 Update available! Run: touch-grass update"
+    echo ""
+  fi
+fi
+
+# Config: TARGET_MAX can override historical max
+TARGET_MAX=${TARGET_MAX:-$HISTORICAL_MAX}
+SOFT_BUFFER=${SOFT_BUFFER:-10}
+HARD_LIMIT=${HARD_LIMIT:-$TARGET_MAX}
+SOFT_LIMIT=${SOFT_LIMIT:-$((TARGET_MAX - SOFT_BUFFER))}
+
+# Get default branch (gh → git local → fallback)
+DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null) \
+  || DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') \
+  || DEFAULT_BRANCH="main"
+
+# Get current branch
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null)
+
+# Count local unpushed commits with today's author date
+LOCAL_TODAY=$(git log origin/$DEFAULT_BRANCH..HEAD --format='%ad' --date=short 2>/dev/null | grep -c "$TODAY")
+[[ -z "$LOCAL_TODAY" ]] && LOCAL_TODAY=0
+
+# Total after this commit
+TOTAL=$((GITHUB_TODAY + LOCAL_TODAY + 1))
+
+# Determine if on default branch
+ON_DEFAULT=false
+[[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]] && ON_DEFAULT=true
+
+if $ON_DEFAULT; then
+  # On default branch - hard warnings
+  if [[ $TOTAL -ge $HARD_LIMIT ]]; then
+    echo ""
+    echo "🌱 Whoa there! You've touched $TOTAL grass squares today!"
+    echo "   GitHub: $GITHUB_TODAY | Local unpushed: $LOCAL_TODAY | This commit: +1"
+    echo "   Your target max is $HARD_LIMIT (historical max: $HISTORICAL_MAX)"
+    echo ""
+    echo "   Maybe go touch some real grass? 🌿"
+    echo ""
+    read -p "Continue anyway? [y/N] " -n 1 -r
+    echo ""
+    [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+  elif [[ $TOTAL -ge $SOFT_LIMIT ]]; then
+    echo ""
+    echo "🌿 Heads up: $TOTAL commits today (GitHub: $GITHUB_TODAY + Local: $LOCAL_TODAY + 1)"
+    echo "   Approaching your target of $HARD_LIMIT. The grass isn't going anywhere!"
+    echo ""
+  fi
+else
+  # On feature branch - soft warning about merge impact
+  if [[ $TOTAL -ge $SOFT_LIMIT ]]; then
+    echo ""
+    echo "🌿 Feature branch notice:"
+    echo "   This branch is $((LOCAL_TODAY + 1)) commits ahead of origin/$DEFAULT_BRANCH (today)"
+    echo "   If merged, you'll have touched ~$TOTAL grass squares today"
+    echo "   Consider squashing before merge!"
+    echo ""
+  fi
+fi
+
+exit 0
